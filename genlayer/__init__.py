@@ -4,6 +4,10 @@ import sys
 class Contract:
     pass
 
+class ContractMock:
+    def __init__(self, contract_class):
+        self.Contract = contract_class
+
 # Storage decorator
 def allow_storage(cls):
     return cls
@@ -128,6 +132,7 @@ class GlMock:
         self.eq_principle = EqPrincipleMock()
         self.evm = EvmMock()
         self.public = PublicMock()
+        self.contract = ContractMock(Contract)
         self.Contract = Contract
 
     def get_contract_at(self, address):

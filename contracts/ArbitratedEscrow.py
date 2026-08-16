@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+import genlayer as gl
 from genlayer import *
 
 
@@ -29,7 +30,7 @@ class _Recipient:
         pass
 
 
-class ArbitratedEscrow(gl.Contract):
+class ArbitratedEscrow(gl.contract.Contract):
     escrows: TreeMap[u256, EscrowRecord]
     next_escrow_id: u256
 
