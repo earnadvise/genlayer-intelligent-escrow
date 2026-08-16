@@ -1,0 +1,3 @@
+pytest>=7.0.0
+# Note: Local direct-mode testing requires installing the GenLayer testing framework:
+# pip install genlayer-test
