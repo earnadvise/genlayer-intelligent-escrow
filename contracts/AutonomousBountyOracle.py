@@ -32,7 +32,7 @@ class VulnerabilityReport:
     report_title: str
     poc_url: str
     claimed_severity: str       # "CRITICAL" | "HIGH" | "MEDIUM" | "LOW"
-    status: str                 # "SUBMITTED" | "TRIAGED" | "PAID" | "REJECTED_SPAM" | "REJECTED_OUT_OF_SCOPE"
+    status: str                 # "SUBMITTED" | "TRIAGED" | "PAID" | "REJECTED_SPAM" | "REJECTED_OUT_OF_SCOPE" | "CANCELLED" | "CANCELLED_POOL_CLOSED"
     stake_amount: u256
     awarded_severity: str       # "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
     awarded_amount: u256
@@ -199,7 +199,14 @@ class AutonomousBountyOracle(gl.Contract):
 
         pool = self.bounty_pools[report.pool_id]
         if not pool.active:
-            raise gl.vm.UserError("Parent bounty pool is inactive")
+            # Prevent stranding stake if pool became inactive: automatically refund researcher stake
+            stake = report.stake_amount
+            report.status = "CANCELLED_POOL_CLOSED"
+            report.triage_reasoning = "Parent bounty pool is inactive; stake refunded."
+            self.reports[report_id] = report
+            if stake > u256(0):
+                _Recipient(report.researcher).emit_transfer(value=stake)
+            return
 
         codebase_url = pool.codebase_url
         scope_desc = pool.scope_description
@@ -314,9 +321,34 @@ class AutonomousBountyOracle(gl.Contract):
         self.reports[report_id] = report
 
     @gl.public.write
+    def cancel_report(self, report_id: u256) -> None:
+        """
+        Allows a researcher to cancel their pending report and reclaim their anti-spam stake
+        if the report has not yet been triaged, or if the parent pool was deactivated.
+        """
+        if report_id not in self.reports:
+            raise gl.vm.UserError("Report not found")
+
+        report = self.reports[report_id]
+        if report.researcher != gl.message.sender_address:
+            raise gl.vm.UserError("Only the reporting researcher can cancel this report")
+
+        if report.status != "SUBMITTED":
+            raise gl.vm.UserError("Only SUBMITTED reports can be cancelled")
+
+        stake = report.stake_amount
+        report.status = "CANCELLED"
+        report.triage_reasoning = "Report cancelled by researcher; stake refunded."
+        self.reports[report_id] = report
+
+        if stake > u256(0):
+            _Recipient(report.researcher).emit_transfer(value=stake)
+
+    @gl.public.write
     def close_bounty_pool(self, pool_id: u256) -> None:
         """
         Allows the sponsor to close the bounty pool and withdraw remaining unspent funds.
+        Atomically resolves and refunds every pending researcher stake so no funds are stranded.
         """
         if pool_id not in self.bounty_pools:
             raise gl.vm.UserError("Bounty pool not found")
@@ -327,6 +359,17 @@ class AutonomousBountyOracle(gl.Contract):
 
         if not pool.active:
             raise gl.vm.UserError("Bounty pool is already closed")
+
+        # Atomically refund all pending reports associated with this pool
+        for r_id in range(int(self.next_report_id)):
+            report = self.reports[u256(r_id)]
+            if report.pool_id == pool_id and report.status == "SUBMITTED":
+                stake = report.stake_amount
+                report.status = "CANCELLED_POOL_CLOSED"
+                report.triage_reasoning = "Bounty pool closed by sponsor; stake refunded to researcher."
+                self.reports[u256(r_id)] = report
+                if stake > u256(0):
+                    _Recipient(report.researcher).emit_transfer(value=stake)
 
         remaining_balance = pool.total_funded - pool.total_paid
         pool.active = False

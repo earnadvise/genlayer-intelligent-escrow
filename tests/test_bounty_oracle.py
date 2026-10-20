@@ -204,3 +204,116 @@ def test_pool_top_up_and_closure(direct_deploy, direct_vm):
     direct_vm.value = u256(100)
     with pytest.raises(Exception):
         oracle.submit_vulnerability(pool_id, "Bug", "https://example.com/p", "LOW")
+
+
+def test_pool_closure_atomically_refunds_pending_stakes(direct_deploy, direct_vm):
+    """
+    Tests that closing a bounty pool with pending SUBMITTED reports atomically
+    refunds all researcher stakes without stranding funds.
+    """
+    oracle = direct_deploy("contracts/AutonomousBountyOracle.py", min_stake=u256(100))
+    sponsor = Address("0x0000000000000000000000000000000000000010")
+    whitehat1 = Address("0x0000000000000000000000000000000000000091")
+    whitehat2 = Address("0x0000000000000000000000000000000000000092")
+
+    # 1. Sponsor creates pool
+    direct_vm.sender = sponsor
+    direct_vm.value = u256(10000)
+    pool_id = oracle.create_bounty_pool(
+        "Bridge", "https://example.com/code", "Bridge contracts.",
+        u256(5000), u256(2000), u256(500), u256(100)
+    )
+
+    # 2. Two researchers submit reports with stakes
+    direct_vm.sender = whitehat1
+    direct_vm.value = u256(150)
+    r1 = oracle.submit_vulnerability(pool_id, "Vuln 1", "https://example.com/p1", "HIGH")
+
+    direct_vm.sender = whitehat2
+    direct_vm.value = u256(200)
+    r2 = oracle.submit_vulnerability(pool_id, "Vuln 2", "https://example.com/p2", "CRITICAL")
+
+    assert oracle.get_report(r1).status == "SUBMITTED"
+    assert oracle.get_report(r2).status == "SUBMITTED"
+
+    # 3. Sponsor closes pool while reports are pending
+    direct_vm.sender = sponsor
+    oracle.close_bounty_pool(pool_id)
+
+    # 4. Verify pool is inactive and all pending reports are atomically refunded
+    assert oracle.get_pool(pool_id).active is False
+
+    rep1 = oracle.get_report(r1)
+    assert rep1.status == "CANCELLED_POOL_CLOSED"
+    assert "stake refunded" in rep1.triage_reasoning
+
+    rep2 = oracle.get_report(r2)
+    assert rep2.status == "CANCELLED_POOL_CLOSED"
+    assert "stake refunded" in rep2.triage_reasoning
+
+
+def test_researcher_can_cancel_submitted_report_and_reclaim_stake(direct_deploy, direct_vm):
+    """
+    Tests that a researcher can voluntarily cancel their pending report and reclaim their stake.
+    """
+    oracle = direct_deploy("contracts/AutonomousBountyOracle.py", min_stake=u256(100))
+    sponsor = Address("0x0000000000000000000000000000000000000010")
+    whitehat = Address("0x0000000000000000000000000000000000000099")
+    imposter = Address("0x0000000000000000000000000000000000000044")
+
+    direct_vm.sender = sponsor
+    direct_vm.value = u256(8000)
+    pool_id = oracle.create_bounty_pool(
+        "Oracle", "https://example.com/code", "Price feed.",
+        u256(5000), u256(2000), u256(500), u256(100)
+    )
+
+    direct_vm.sender = whitehat
+    direct_vm.value = u256(100)
+    r_id = oracle.submit_vulnerability(pool_id, "Stale Price", "https://example.com/p", "MEDIUM")
+
+    # Imposter cannot cancel
+    direct_vm.sender = imposter
+    with pytest.raises(Exception):
+        oracle.cancel_report(r_id)
+
+    # True researcher cancels
+    direct_vm.sender = whitehat
+    oracle.cancel_report(r_id)
+
+    rep = oracle.get_report(r_id)
+    assert rep.status == "CANCELLED"
+    assert "cancelled by researcher" in rep.triage_reasoning.lower()
+
+
+def test_triage_on_inactive_pool_refunds_stake(direct_deploy, direct_vm):
+    """
+    Tests that calling triage_and_settle on an inactive pool safely refunds
+    the researcher's stake rather than reverting and locking it.
+    """
+    oracle = direct_deploy("contracts/AutonomousBountyOracle.py", min_stake=u256(100))
+    sponsor = Address("0x0000000000000000000000000000000000000010")
+    whitehat = Address("0x0000000000000000000000000000000000000099")
+
+    direct_vm.sender = sponsor
+    direct_vm.value = u256(5000)
+    pool_id = oracle.create_bounty_pool(
+        "Protocol", "https://example.com/code", "Scope.",
+        u256(4000), u256(2000), u256(500), u256(100)
+    )
+
+    direct_vm.sender = whitehat
+    direct_vm.value = u256(100)
+    r_id = oracle.submit_vulnerability(pool_id, "Bug", "https://example.com/p", "LOW")
+
+    # Simulate pool deactivated directly or externally
+    pool = oracle.get_pool(pool_id)
+    pool.active = False
+    oracle.bounty_pools[pool_id] = pool
+
+    # Triage does not revert; it refunds the stake
+    oracle.triage_and_settle(r_id)
+
+    rep = oracle.get_report(r_id)
+    assert rep.status == "CANCELLED_POOL_CLOSED"
+    assert "stake refunded" in rep.triage_reasoning
